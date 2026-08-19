@@ -1,0 +1,56 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  background-color: #f4e9dc;
+}
+
+:root {
+  --clay-dark: rgba(166, 112, 66, 0.28);
+  --clay-light: rgba(255, 255, 255, 0.9);
+}
+
+/* Raised clay surface - cards, panels, the logo medallion. */
+.clay {
+  background: linear-gradient(145deg, #ffffff, #f2e4d2);
+  box-shadow: 9px 9px 20px var(--clay-dark), -9px -9px 20px var(--clay-light);
+  border-radius: 28px;
+}
+
+/* Pressed-in surface - inputs, the table well. Reads as "carved" rather than "raised". */
+.clay-well {
+  background: #f2e6d5;
+  box-shadow: inset 5px 5px 11px var(--clay-dark),
+    inset -5px -5px 11px var(--clay-light);
+  border-radius: 16px;
+}
+
+/* Puffy, tactile button - pushes in on press. */
+.clay-btn {
+  border-radius: 20px;
+  box-shadow: 6px 6px 14px var(--clay-dark), -6px -6px 14px var(--clay-light);
+  transition: box-shadow 0.12s ease, transform 0.12s ease;
+}
+.clay-btn:active {
+  box-shadow: inset 4px 4px 9px var(--clay-dark),
+    inset -4px -4px 9px var(--clay-light);
+  transform: translateY(1px);
+}
+
+/* Same tactile behavior, sized for small inline actions (Save / Remove links). */
+.clay-chip {
+  border-radius: 999px;
+  box-shadow: 3px 3px 7px var(--clay-dark), -3px -3px 7px var(--clay-light);
+  transition: box-shadow 0.12s ease, transform 0.12s ease;
+}
+.clay-chip:active {
+  box-shadow: inset 2px 2px 5px var(--clay-dark),
+    inset -2px -2px 5px var(--clay-light);
+  transform: translateY(1px);
+}
