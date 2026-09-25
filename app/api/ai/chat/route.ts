@@ -206,11 +206,13 @@ async function runTool(
 
     return { data: { error: "unknown_tool" }, chart: null };
   } catch (e) {
+    const message = e instanceof Error ? e.message : "Unknown error";
+    // Logged server-side (visible in Vercel's function logs) so the real
+    // cause is diagnosable - Calu only ever sees a generic message, never
+    // the raw error, to avoid leaking connection details into chat.
+    console.error(`[Calu] ${toolUse.name} failed:`, e);
     return {
-      data: {
-        error: "query_failed",
-        message: e instanceof Error ? e.message : "Unknown error",
-      },
+      data: { error: "query_failed", message },
       chart: null,
     };
   }
