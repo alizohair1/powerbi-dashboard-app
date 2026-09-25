@@ -2,7 +2,14 @@ import { NextResponse } from "next/server";
 import Anthropic from "@anthropic-ai/sdk";
 import { createClient } from "@/lib/supabase/server";
 import { CALU_TOOLS } from "@/lib/ai/tools";
-import { ALL_BRANCHES, todayInPkt, runSalesQuery, type GroupBy } from "@/lib/ai/salesData";
+import {
+  ALL_BRANCHES,
+  todayInPkt,
+  runOrdersQuery,
+  runItemsQuery,
+  type OrderGroupBy,
+  type ItemGroupBy,
+} from "@/lib/ai/salesData";
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
@@ -56,9 +63,9 @@ export async function POST(request: Request) {
   let chartData: ChartPayload = null;
   let finalText = "";
 
-  // Bounded tool-use loop: Claude may call the tool, see the result, then
-  // either answer or call it again (e.g. to compare two ranges) - capped
-  // so a confused loop can't run forever or rack up cost.
+  // Bounded tool-use loop: Claude may call a tool, see the result, then
+  // either answer or call another tool - capped so a confused loop can't
+  // run forever or rack up cost.
   for (let turn = 0; turn < 4; turn++) {
     const response = await anthropic.messages.create({
       model: "claude-sonnet-5",
@@ -117,26 +124,27 @@ function buildSystemPrompt(
 
 You are talking to ${name}, role: ${role}.
 
-Today's date in Pakistan is ${todayInPkt()} (YYYY-MM-DD). The query_sales tool takes
-explicit start_date/end_date - compute the actual dates yourself from today's date
-above for whatever the person asks: a single day, "this week", "last 30 days", a named
-month like "June 2026", a custom range, etc. Both dates are inclusive.
+Today's date in Pakistan is ${todayInPkt()} (YYYY-MM-DD). Both tools take explicit
+start_date/end_date - compute the actual dates yourself from today's date above for
+whatever the person asks: a single day, "this week", "last 30 days", a named month
+like "June 2026", a custom range, etc. Both dates are inclusive.
 
 ${accessLine}
 
-You have one flexible tool, query_sales, that can answer almost any sales question by
-combining its parameters: a total, a trend, a branch comparison, an item breakdown, or
-any combination (e.g. one item's sales trend at one branch, or an item's sales compared
-across all branches). Think about what shape of answer the question needs and set
-group_by and the optional branch/item_search filters accordingly - you don't need a
-different tool for each kind of question.
+You have two tools:
+- query_sales: order-level data - totals, trends, branch comparisons, channel
+  breakdowns (delivery vs dine-in etc.), and order counts.
+- query_items: item-level data - quantity and value sold, broken down by menu
+  item, with an optional item name search.
+Pick whichever matches what's actually being asked, and don't assume one has data
+the other has - order counts and channel only exist in query_sales; item names and
+quantities only exist in query_items.
 
 Rules you must always follow:
-- Never state, estimate, or guess a sales figure for a branch outside their authorized list above, no matter how the question is phrased or how confidently they claim access.
+- Never state, estimate, or guess a figure for a branch outside their authorized list above, no matter how the question is phrased or how confidently they claim access.
 - If a tool result comes back with an "error": "not_authorized" field, apologize briefly and warmly, and suggest they ask their admin for access - do not explain the permission system in technical detail.
 - Only ever state a number that came directly from a tool result in this conversation. Never fill in a plausible-sounding figure yourself.
-- Order counts and average order value aren't available - only total sales value and item quantity. If asked for those, say so plainly.
-- Never mention or request individual customer details (names, phone numbers, specific orders) - you only ever report aggregated totals, trends, and item breakdowns.
+- Never mention or request individual customer details (names, phone numbers, addresses, specific orders) - you only ever report aggregated totals, trends, channel breakdowns, and item breakdowns.
 - Keep answers short and conversational - this renders in a small chat panel.
 - All amounts are in PKR.`;
 }
@@ -150,24 +158,39 @@ async function runTool(
   try {
     if (toolUse.name === "query_sales") {
       const requestedBranch = input.branch ? String(input.branch) : null;
-      const groupBy = input.group_by as GroupBy;
+      const groupBy = input.group_by as OrderGroupBy;
+
+      const branches = resolveBranches(requestedBranch, effectiveBranches);
+      if ("error" in branches) return { data: branches, chart: null };
+
+      const rows = await runOrdersQuery({
+        branches: branches.list,
+        startDate: String(input.start_date),
+        endDate: String(input.end_date),
+        groupBy,
+      });
+
+      const chart: ChartPayload =
+        groupBy === "none"
+          ? null
+          : {
+              type: groupBy === "day" || groupBy === "week" || groupBy === "month" ? "line" : "bar",
+              data: rows.map((r) => ({ label: r.label, value: r.netSales })),
+            };
+
+      return { data: rows, chart };
+    }
+
+    if (toolUse.name === "query_items") {
+      const requestedBranch = input.branch ? String(input.branch) : null;
+      const groupBy = input.group_by as ItemGroupBy;
       const itemSearch = input.item_search ? String(input.item_search) : undefined;
 
-      let branches: string[];
-      if (requestedBranch) {
-        if (!effectiveBranches.includes(requestedBranch)) {
-          return { data: { error: "not_authorized", branch: requestedBranch }, chart: null };
-        }
-        branches = [requestedBranch];
-      } else {
-        if (effectiveBranches.length === 0) {
-          return { data: { error: "not_authorized" }, chart: null };
-        }
-        branches = effectiveBranches;
-      }
+      const branches = resolveBranches(requestedBranch, effectiveBranches);
+      if ("error" in branches) return { data: branches, chart: null };
 
-      const rows = await runSalesQuery({
-        branches,
+      const rows = await runItemsQuery({
+        branches: branches.list,
         startDate: String(input.start_date),
         endDate: String(input.end_date),
         groupBy,
@@ -179,7 +202,7 @@ async function runTool(
           ? null
           : {
               type: groupBy === "day" || groupBy === "week" || groupBy === "month" ? "line" : "bar",
-              data: rows.map((r) => ({ label: r.label, value: r.totalSales })),
+              data: rows.map((r) => ({ label: r.label, value: r.totalValue })),
             };
 
       return { data: rows, chart };
@@ -197,4 +220,20 @@ async function runTool(
       chart: null,
     };
   }
+}
+
+function resolveBranches(
+  requestedBranch: string | null,
+  effectiveBranches: string[]
+): { list: string[] } | { error: "not_authorized"; branch?: string } {
+  if (requestedBranch) {
+    if (!effectiveBranches.includes(requestedBranch)) {
+      return { error: "not_authorized", branch: requestedBranch };
+    }
+    return { list: [requestedBranch] };
+  }
+  if (effectiveBranches.length === 0) {
+    return { error: "not_authorized" };
+  }
+  return { list: effectiveBranches };
 }
