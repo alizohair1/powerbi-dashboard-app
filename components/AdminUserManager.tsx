@@ -2,6 +2,16 @@
 
 import { useEffect, useState } from "react";
 
+const BRANCHES = [
+  "Bahria Town",
+  "DHA Phase 4",
+  "DHA Phase 6",
+  "Emporium",
+  "Gulberg",
+  "Johar Town",
+  "Valencia",
+];
+
 type UserRow = {
   id: string;
   email: string;
@@ -9,6 +19,7 @@ type UserRow = {
   role: "admin" | "user";
   branch: string | null;
   dashboard_url: string | null;
+  allowed_branches: string[] | null;
   created_at: string;
 };
 
@@ -90,7 +101,7 @@ export default function AdminUserManager() {
       {loading ? (
         <p className="text-sm text-ink/50">Loading…</p>
       ) : (
-        <div className="clay overflow-hidden">
+        <div className="clay overflow-visible">
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
               <thead>
@@ -102,6 +113,9 @@ export default function AdminUserManager() {
                     Dashboard link
                   </th>
                   <th className="px-5 pt-5 pb-3 font-medium">Role</th>
+                  <th className="px-5 pt-5 pb-3 font-medium">
+                    Calu data access
+                  </th>
                   <th className="px-5 pt-5 pb-3 font-medium"></th>
                 </tr>
               </thead>
@@ -117,7 +131,7 @@ export default function AdminUserManager() {
                 {users.length === 0 && (
                   <tr>
                     <td
-                      colSpan={6}
+                      colSpan={7}
                       className="px-5 py-10 text-center text-ink/40"
                     >
                       No one added yet.
@@ -143,6 +157,46 @@ export default function AdminUserManager() {
   );
 }
 
+function BranchAccessEditor({
+  selected,
+  onChange,
+}: {
+  selected: string[];
+  onChange: (next: string[]) => void;
+}) {
+  function toggle(branch: string) {
+    if (selected.includes(branch)) {
+      onChange(selected.filter((b) => b !== branch));
+    } else {
+      onChange([...selected, branch]);
+    }
+  }
+
+  return (
+    <div className="clay absolute right-0 top-full z-20 mt-2 w-56 p-3">
+      <p className="text-xs font-medium text-ink/50 mb-2">
+        Branches this person can ask Calu about
+      </p>
+      <div className="space-y-1.5 max-h-48 overflow-y-auto">
+        {BRANCHES.map((branch) => (
+          <label
+            key={branch}
+            className="flex items-center gap-2 text-sm text-ink cursor-pointer"
+          >
+            <input
+              type="checkbox"
+              checked={selected.includes(branch)}
+              onChange={() => toggle(branch)}
+              className="accent-accent"
+            />
+            {branch}
+          </label>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function UserRowEditor({
   user,
   onSave,
@@ -155,6 +209,8 @@ function UserRowEditor({
   const [dashboardUrl, setDashboardUrl] = useState(user.dashboard_url || "");
   const [branch, setBranch] = useState(user.branch || "");
   const [dirty, setDirty] = useState(false);
+  const [showAccess, setShowAccess] = useState(false);
+  const allowedBranches = user.allowed_branches || [];
 
   return (
     <tr className="align-top">
@@ -197,6 +253,30 @@ function UserRowEditor({
           <option value="admin">Admin</option>
         </select>
       </td>
+      <td className="px-5 py-3 relative">
+        {user.role === "admin" ? (
+          <span className="text-xs text-ink/50">All branches</span>
+        ) : (
+          <>
+            <button
+              onClick={() => setShowAccess((s) => !s)}
+              className="clay-chip px-3 py-1.5 text-xs font-medium text-ink"
+            >
+              {allowedBranches.length === 0
+                ? "No access set"
+                : `${allowedBranches.length} branch${
+                    allowedBranches.length === 1 ? "" : "es"
+                  }`}
+            </button>
+            {showAccess && (
+              <BranchAccessEditor
+                selected={allowedBranches}
+                onChange={(next) => onSave({ allowed_branches: next })}
+              />
+            )}
+          </>
+        )}
+      </td>
       <td className="px-5 py-3 text-right whitespace-nowrap">
         <div className="flex justify-end gap-2">
           {dirty && (
@@ -235,8 +315,15 @@ function AddUserModal({
   const [branch, setBranch] = useState("");
   const [dashboardUrl, setDashboardUrl] = useState("");
   const [role, setRole] = useState<"admin" | "user">("user");
+  const [allowedBranches, setAllowedBranches] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+
+  function toggleBranch(b: string) {
+    setAllowedBranches((prev) =>
+      prev.includes(b) ? prev.filter((x) => x !== b) : [...prev, b]
+    );
+  }
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -253,6 +340,7 @@ function AddUserModal({
         branch,
         dashboard_url: dashboardUrl,
         role,
+        allowed_branches: allowedBranches,
       }),
     });
 
@@ -319,6 +407,30 @@ function AddUserModal({
             <option value="user">User</option>
             <option value="admin">Admin</option>
           </select>
+
+          {role === "user" && (
+            <div className="clay-well px-4 py-3">
+              <p className="text-xs font-medium text-ink/50 mb-2">
+                Branches this person can ask Calu about
+              </p>
+              <div className="grid grid-cols-2 gap-y-1.5">
+                {BRANCHES.map((b) => (
+                  <label
+                    key={b}
+                    className="flex items-center gap-2 text-sm text-ink cursor-pointer"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={allowedBranches.includes(b)}
+                      onChange={() => toggleBranch(b)}
+                      className="accent-accent"
+                    />
+                    {b}
+                  </label>
+                ))}
+              </div>
+            </div>
+          )}
 
           {error && (
             <p className="text-sm text-warn bg-warn/10 rounded-clay-sm px-3 py-2">
