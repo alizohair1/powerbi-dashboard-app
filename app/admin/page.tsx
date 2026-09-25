@@ -1,5 +1,6 @@
 import { redirect } from "next/navigation";
 import Image from "next/image";
+import Link from "next/link";
 import { createClient } from "@/lib/supabase/server";
 import LogoutButton from "@/components/LogoutButton";
 import AdminUserManager from "@/components/AdminUserManager";
@@ -25,7 +26,15 @@ export default async function AdminPage() {
             <p className="font-display font-semibold text-ink">{profile?.full_name || user.email}</p>
           </div>
         </div>
-        <LogoutButton />
+        <div className="flex items-center gap-2">
+          <Link
+            href="/ai"
+            className="clay-chip px-4 py-2 text-sm font-medium text-ink/70 hover:text-ink"
+          >
+            🧪 Ask Calu
+          </Link>
+          <LogoutButton />
+        </div>
       </header>
       <main className="max-w-5xl mx-auto px-6 pb-10">
         <AdminUserManager />
