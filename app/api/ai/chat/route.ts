@@ -4,10 +4,11 @@ import { createClient } from "@/lib/supabase/server";
 import { CALU_TOOLS } from "@/lib/ai/tools";
 import {
   ALL_BRANCHES,
-  getSalesSummary,
+  todayInPkt,
+  getSalesTotal,
   getSalesByBranch,
-  getSalesTrend,
-  type Period,
+  getSalesSeries,
+  type GroupBy,
 } from "@/lib/ai/salesData";
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
@@ -123,6 +124,12 @@ function buildSystemPrompt(
 
 You are talking to ${name}, role: ${role}.
 
+Today's date in Pakistan is ${todayInPkt()} (YYYY-MM-DD). All the sales tools take
+explicit start_date/end_date - there is no built-in "today" or "this month" concept
+in the tools themselves, so compute the actual dates yourself from today's date above
+for whatever the person asks: a single day, "this week", "last 30 days", a named month
+like "June 2026", a custom range, etc. Both dates are inclusive.
+
 ${accessLine}
 
 Rules you must always follow:
@@ -141,26 +148,31 @@ async function runTool(
   const input = toolUse.input as Record<string, unknown>;
 
   try {
-    if (toolUse.name === "get_sales_summary") {
+    if (toolUse.name === "get_sales_total") {
       const branch = String(input.branch);
-      const period = input.period as Period;
 
       if (!effectiveBranches.includes(branch)) {
         return { data: { error: "not_authorized", branch }, chart: null };
       }
 
-      const summary = await getSalesSummary(branch, period);
+      const summary = await getSalesTotal(
+        branch,
+        String(input.start_date),
+        String(input.end_date)
+      );
       return { data: summary, chart: null };
     }
 
     if (toolUse.name === "get_sales_by_branch") {
-      const period = input.period as Period;
-
       if (effectiveBranches.length === 0) {
         return { data: { error: "not_authorized" }, chart: null };
       }
 
-      const summaries = await getSalesByBranch(effectiveBranches, period);
+      const summaries = await getSalesByBranch(
+        effectiveBranches,
+        String(input.start_date),
+        String(input.end_date)
+      );
       return {
         data: summaries,
         chart: {
@@ -170,20 +182,24 @@ async function runTool(
       };
     }
 
-    if (toolUse.name === "get_sales_trend") {
+    if (toolUse.name === "get_sales_series") {
       const branch = String(input.branch);
-      const days = Number(input.days) || 7;
 
       if (!effectiveBranches.includes(branch)) {
         return { data: { error: "not_authorized", branch }, chart: null };
       }
 
-      const trend = await getSalesTrend(branch, days);
+      const series = await getSalesSeries(
+        branch,
+        String(input.start_date),
+        String(input.end_date),
+        input.group_by as GroupBy
+      );
       return {
-        data: trend,
+        data: series,
         chart: {
           type: "line",
-          data: trend.map((p) => ({ label: p.date, value: p.totalSales })),
+          data: series.map((p) => ({ label: p.period, value: p.totalSales })),
         },
       };
     }
