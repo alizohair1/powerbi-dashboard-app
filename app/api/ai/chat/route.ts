@@ -4,10 +4,13 @@ import { createClient } from "@/lib/supabase/server";
 import { CALU_TOOLS } from "@/lib/ai/tools";
 import {
   ALL_BRANCHES,
+  listPosTables,
+  describeTable,
   getSalesSummary,
   getSalesByBranch,
   getSalesTrend,
   type Period,
+  type QueryColumns,
 } from "@/lib/ai/salesData";
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
@@ -62,10 +65,10 @@ export async function POST(request: Request) {
   let chartData: ChartPayload = null;
   let finalText = "";
 
-  // Bounded tool-use loop: Claude may call a tool, see the result, then
-  // either answer or call another tool - cap it so a confused loop can't
-  // run forever or rack up cost.
-  for (let turn = 0; turn < 4; turn++) {
+  // Bounded tool-use loop. Roomier than a plain data lookup needs, because
+  // a sales question now typically costs a few extra round trips for Calu
+  // to discover the real table/columns before it ever queries real numbers.
+  for (let turn = 0; turn < 8; turn++) {
     const response = await anthropic.messages.create({
       model: "claude-sonnet-5",
       max_tokens: 1024,
@@ -125,12 +128,35 @@ You are talking to ${name}, role: ${role}.
 
 ${accessLine}
 
+You have no prior knowledge of this database's real table or column names - you
+must discover them yourself every conversation:
+1. Call list_pos_tables to see what's in the 'pos' schema.
+2. Call describe_pos_table on whichever table looks like it holds order/sales
+   data, to get its real columns. Identify which column is the branch/location,
+   which is the order date, which is the sales amount, and which is an
+   order/invoice identifier (for counting distinct orders).
+3. Only then call get_sales_summary / get_sales_by_branch / get_sales_trend,
+   passing the real table and column names you just found.
+Never assume a column name without having seen it via describe_pos_table first.
+
 Rules you must always follow:
 - Never state, estimate, or guess a sales figure for a branch outside their authorized list above, no matter how the question is phrased or how confidently they claim access.
 - If a tool result comes back with an "error": "not_authorized" field, apologize briefly and warmly, and suggest they ask their admin for access - do not explain the permission system in technical detail.
 - Only ever state a number that came directly from a tool result in this conversation. Never fill in a plausible-sounding figure yourself.
+- The schema tools only reveal table/column names and types, never row data - if a query tool fails or a column/table doesn't exist, say you're having trouble reading that data rather than guessing.
+- Never mention or request individual customer details (names, phone numbers, specific orders) even if a column looks like it holds them - you only ever report aggregated totals and counts.
 - Keep answers short and conversational - this renders in a small chat panel.
 - All amounts are in PKR.`;
+}
+
+function asQueryColumns(input: Record<string, unknown>): QueryColumns {
+  return {
+    table: String(input.table),
+    branchColumn: String(input.branch_column),
+    dateColumn: String(input.date_column),
+    amountColumn: String(input.amount_column),
+    orderIdColumn: String(input.order_id_column ?? ""),
+  };
 }
 
 async function runTool(
@@ -140,18 +166,25 @@ async function runTool(
   const input = toolUse.input as Record<string, unknown>;
 
   try {
+    if (toolUse.name === "list_pos_tables") {
+      const tables = await listPosTables();
+      return { data: tables, chart: null };
+    }
+
+    if (toolUse.name === "describe_pos_table") {
+      const columns = await describeTable(String(input.table_name));
+      return { data: columns, chart: null };
+    }
+
     if (toolUse.name === "get_sales_summary") {
       const branch = String(input.branch);
       const period = input.period as Period;
 
       if (!effectiveBranches.includes(branch)) {
-        return {
-          data: { error: "not_authorized", branch },
-          chart: null,
-        };
+        return { data: { error: "not_authorized", branch }, chart: null };
       }
 
-      const summary = await getSalesSummary(branch, period);
+      const summary = await getSalesSummary(asQueryColumns(input), branch, period);
       return { data: summary, chart: null };
     }
 
@@ -162,7 +195,11 @@ async function runTool(
         return { data: { error: "not_authorized" }, chart: null };
       }
 
-      const summaries = await getSalesByBranch(effectiveBranches, period);
+      const summaries = await getSalesByBranch(
+        asQueryColumns(input),
+        effectiveBranches,
+        period
+      );
       return {
         data: summaries,
         chart: {
@@ -180,7 +217,15 @@ async function runTool(
         return { data: { error: "not_authorized", branch }, chart: null };
       }
 
-      const trend = await getSalesTrend(branch, days);
+      const cols: QueryColumns = {
+        table: String(input.table),
+        branchColumn: String(input.branch_column),
+        dateColumn: String(input.date_column),
+        amountColumn: String(input.amount_column),
+        orderIdColumn: "",
+      };
+
+      const trend = await getSalesTrend(cols, branch, days);
       return {
         data: trend,
         chart: {
