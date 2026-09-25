@@ -6,11 +6,14 @@ import { Pool } from "pg";
 // the only file to update.
 //
 // NOTE: there's no confirmed order/invoice-id column, so order counts and
-// average order value aren't available yet - only total sales value.
+// average order value aren't available - only total sales value and
+// item quantity.
 const TABLE = "vw_order_items";
 const COL_BRANCH = "branch_name";
 const COL_DATE = "business_date"; // plain `date` column, no time component
 const COL_AMOUNT = "line_value";
+const COL_ITEM_NAME = "item_name";
+const COL_QTY = "qty";
 const SCHEMA = "pos";
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -75,71 +78,94 @@ function assertValidRange(startDate: string, endDate: string): void {
   }
 }
 
-export interface BranchSummary {
-  branch: string;
+export type GroupBy = "none" | "day" | "week" | "month" | "branch" | "item";
+
+export interface QueryRow {
+  label: string;
   totalSales: number;
+  quantity: number;
 }
 
-// Both dates are inclusive.
-export async function getSalesTotal(
-  branch: string,
-  startDate: string,
-  endDate: string
-): Promise<BranchSummary> {
-  assertValidRange(startDate, endDate);
+export interface SalesQueryParams {
+  // Already permission-filtered by the caller - this function trusts the
+  // list it's given, so all enforcement must happen before calling this.
+  branches: string[];
+  startDate: string;
+  endDate: string;
+  groupBy: GroupBy;
+  itemSearch?: string;
+}
+
+// The one general-purpose query behind every sales question Calu can
+// answer: a total, a trend over time, a branch comparison, or an item
+// breakdown - all through the same safe, parameterized shape. Every
+// identifier below (table/column names) is a fixed constant from this
+// file, never something supplied by the model - only values (branch
+// names, dates, the item search text) come from the caller, and those
+// are always passed as bound query parameters, never concatenated into
+// the SQL text.
+export async function runSalesQuery(params: SalesQueryParams): Promise<QueryRow[]> {
+  assertValidRange(params.startDate, params.endDate);
+  if (params.branches.length === 0) return [];
+
+  const conditions = [
+    `${COL_BRANCH} = ANY($1)`,
+    `${COL_DATE} >= $2::date`,
+    `${COL_DATE} <= $3::date`,
+  ];
+  const values: unknown[] = [params.branches, params.startDate, params.endDate];
+
+  if (params.itemSearch) {
+    values.push(`%${params.itemSearch}%`);
+    conditions.push(`${COL_ITEM_NAME} ilike $${values.length}`);
+  }
+
+  let groupExpr = "";
+  let labelExpr = "'Total'";
+  const isTimeGrouping =
+    params.groupBy === "day" || params.groupBy === "week" || params.groupBy === "month";
+
+  if (params.groupBy === "day") {
+    groupExpr = COL_DATE;
+    labelExpr = `to_char(${COL_DATE}, 'YYYY-MM-DD')`;
+  } else if (params.groupBy === "week" || params.groupBy === "month") {
+    const trunc = params.groupBy;
+    groupExpr = `date_trunc('${trunc}', ${COL_DATE})`;
+    labelExpr = `to_char(date_trunc('${trunc}', ${COL_DATE}), 'YYYY-MM-DD')`;
+  } else if (params.groupBy === "branch") {
+    groupExpr = COL_BRANCH;
+    labelExpr = COL_BRANCH;
+  } else if (params.groupBy === "item") {
+    groupExpr = COL_ITEM_NAME;
+    labelExpr = COL_ITEM_NAME;
+  }
+
+  const groupClause = groupExpr ? `group by ${groupExpr}` : "";
+  const orderClause =
+    params.groupBy === "none"
+      ? ""
+      : isTimeGrouping
+        ? `order by ${groupExpr}`
+        : `order by total_sales desc`;
+  const limitClause = isTimeGrouping ? "limit 200" : params.groupBy === "none" ? "" : "limit 50";
+
+  const sql = `
+    select
+      ${labelExpr} as label,
+      coalesce(sum(${COL_AMOUNT}), 0) as total_sales,
+      coalesce(sum(${COL_QTY}), 0) as quantity
+    from ${SCHEMA}.${TABLE}
+    where ${conditions.join(" and ")}
+    ${groupClause}
+    ${orderClause}
+    ${limitClause}
+  `;
+
   const db = getPool();
-  const result = await db.query(
-    `select coalesce(sum(${COL_AMOUNT}), 0) as total_sales
-     from ${SCHEMA}.${TABLE}
-     where ${COL_BRANCH} = $1
-       and ${COL_DATE} >= $2::date
-       and ${COL_DATE} <= $3::date`,
-    [branch, startDate, endDate]
-  );
-  return { branch, totalSales: Number(result.rows[0]?.total_sales ?? 0) };
-}
-
-export async function getSalesByBranch(
-  branches: string[],
-  startDate: string,
-  endDate: string
-): Promise<BranchSummary[]> {
-  return Promise.all(branches.map((b) => getSalesTotal(b, startDate, endDate)));
-}
-
-export type GroupBy = "day" | "week" | "month";
-
-export interface SeriesPoint {
-  period: string;
-  totalSales: number;
-}
-
-// Breaks one branch's sales into equal buckets (day/week/month) across an
-// arbitrary range - this is what lets Calu answer "break June down by week"
-// or "daily trend for the last 30 days" with the same underlying query.
-export async function getSalesSeries(
-  branch: string,
-  startDate: string,
-  endDate: string,
-  groupBy: GroupBy
-): Promise<SeriesPoint[]> {
-  assertValidRange(startDate, endDate);
-  const trunc = groupBy === "day" ? "day" : groupBy === "week" ? "week" : "month";
-  const db = getPool();
-  const result = await db.query(
-    `select
-       date_trunc('${trunc}', ${COL_DATE}) as period,
-       coalesce(sum(${COL_AMOUNT}), 0) as total_sales
-     from ${SCHEMA}.${TABLE}
-     where ${COL_BRANCH} = $1
-       and ${COL_DATE} >= $2::date
-       and ${COL_DATE} <= $3::date
-     group by 1
-     order by 1`,
-    [branch, startDate, endDate]
-  );
+  const result = await db.query(sql, values);
   return result.rows.map((r) => ({
-    period: new Date(r.period as string).toISOString().slice(0, 10),
+    label: String(r.label),
     totalSales: Number(r.total_sales),
+    quantity: Number(r.quantity),
   }));
 }
