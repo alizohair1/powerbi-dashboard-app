@@ -1,20 +1,32 @@
 import { Pool } from "pg";
 
 // ─────────────────────────────────────────────────────────────────────────
-// Confirmed live against pos.vw_order_items via information_schema and a
-// distinct-values check on 2026-09-25. If the schema ever changes, this is
-// the only file to update.
+// Confirmed live against the pos schema on 2026-09-25 via information_schema
+// and a full column check across vw_orders, vw_order_items, and related
+// tables. If the schema ever changes, this is the only file to update.
 //
-// NOTE: there's no confirmed order/invoice-id column, so order counts and
-// average order value aren't available - only total sales value and
-// item quantity.
-const TABLE = "vw_order_items";
-const COL_BRANCH = "branch_name";
-const COL_DATE = "business_date"; // plain `date` column, no time component
-const COL_AMOUNT = "line_value";
-const COL_ITEM_NAME = "item_name";
-const COL_QTY = "qty";
+// Two different grains of data live here on purpose, queried separately:
+//   - vw_orders: one row per ORDER. Has branch, date, net/gross sales,
+//     channel, channel_group, payment method. This is the source for
+//     totals, order counts, and channel breakdowns.
+//   - vw_order_items: one row per LINE ITEM. Has item name and quantity,
+//     but no channel. This is the source for item-level breakdowns.
+// Both deliberately exclude order_master's customer_name/phone/full_address
+// columns - Calu never queries anything with those in it.
 const SCHEMA = "pos";
+
+const ORDERS_TABLE = "vw_orders";
+const ITEMS_TABLE = "vw_order_items";
+
+const COL_BRANCH = "branch_name"; // present on both views
+const COL_DATE = "business_date"; // plain `date` column on both, no time component
+const COL_NET_SALES = "net_sales"; // vw_orders only
+const COL_GROSS_SALES = "gross_sales"; // vw_orders only
+const COL_CHANNEL = "channel"; // vw_orders only, e.g. a specific delivery app
+const COL_CHANNEL_GROUP = "channel_group"; // vw_orders only, broader bucket e.g. delivery vs dine-in
+const COL_LINE_VALUE = "line_value"; // vw_order_items only
+const COL_ITEM_NAME = "item_name"; // vw_order_items only
+const COL_QTY = "qty"; // vw_order_items only
 // ─────────────────────────────────────────────────────────────────────────
 
 let pool: Pool | null = null;
@@ -78,33 +90,116 @@ function assertValidRange(startDate: string, endDate: string): void {
   }
 }
 
-export type GroupBy = "none" | "day" | "week" | "month" | "branch" | "item";
+function groupingSql(
+  groupBy: string,
+  dateCol: string,
+  branchCol: string,
+  extraCols: Record<string, string>
+): { groupExpr: string; labelExpr: string; isTimeGrouping: boolean } {
+  const isTimeGrouping = groupBy === "day" || groupBy === "week" || groupBy === "month";
 
-export interface QueryRow {
-  label: string;
-  totalSales: number;
-  quantity: number;
+  if (groupBy === "day") {
+    return { groupExpr: dateCol, labelExpr: `to_char(${dateCol}, 'YYYY-MM-DD')`, isTimeGrouping };
+  }
+  if (groupBy === "week" || groupBy === "month") {
+    const expr = `date_trunc('${groupBy}', ${dateCol})`;
+    return { groupExpr: expr, labelExpr: `to_char(${expr}, 'YYYY-MM-DD')`, isTimeGrouping };
+  }
+  if (groupBy === "branch") {
+    return { groupExpr: branchCol, labelExpr: branchCol, isTimeGrouping };
+  }
+  if (groupBy in extraCols) {
+    const col = extraCols[groupBy];
+    return { groupExpr: col, labelExpr: col, isTimeGrouping };
+  }
+  return { groupExpr: "", labelExpr: "'Total'", isTimeGrouping };
 }
 
-export interface SalesQueryParams {
-  // Already permission-filtered by the caller - this function trusts the
-  // list it's given, so all enforcement must happen before calling this.
+// ─────────────────────────────────────────────────────────────────────────
+// Order-level queries (vw_orders): totals, trends, branch comparisons,
+// channel breakdowns, and order counts.
+// ─────────────────────────────────────────────────────────────────────────
+
+export type OrderGroupBy = "none" | "day" | "week" | "month" | "branch" | "channel" | "channel_group";
+
+export interface OrderQueryRow {
+  label: string;
+  netSales: number;
+  grossSales: number;
+  orderCount: number;
+}
+
+export interface OrderQueryParams {
+  // Already permission-filtered by the caller.
   branches: string[];
   startDate: string;
   endDate: string;
-  groupBy: GroupBy;
+  groupBy: OrderGroupBy;
+}
+
+export async function runOrdersQuery(params: OrderQueryParams): Promise<OrderQueryRow[]> {
+  assertValidRange(params.startDate, params.endDate);
+  if (params.branches.length === 0) return [];
+
+  const { groupExpr, labelExpr, isTimeGrouping } = groupingSql(
+    params.groupBy,
+    COL_DATE,
+    COL_BRANCH,
+    { channel: COL_CHANNEL, channel_group: COL_CHANNEL_GROUP }
+  );
+
+  const groupClause = groupExpr ? `group by ${groupExpr}` : "";
+  const orderClause =
+    params.groupBy === "none" ? "" : isTimeGrouping ? `order by ${groupExpr}` : `order by net_sales desc`;
+  const limitClause = isTimeGrouping ? "limit 200" : params.groupBy === "none" ? "" : "limit 50";
+
+  const sql = `
+    select
+      ${labelExpr} as label,
+      coalesce(sum(${COL_NET_SALES}), 0) as net_sales,
+      coalesce(sum(${COL_GROSS_SALES}), 0) as gross_sales,
+      count(*) as order_count
+    from ${SCHEMA}.${ORDERS_TABLE}
+    where ${COL_BRANCH} = ANY($1)
+      and ${COL_DATE} >= $2::date
+      and ${COL_DATE} <= $3::date
+    ${groupClause}
+    ${orderClause}
+    ${limitClause}
+  `;
+
+  const db = getPool();
+  const result = await db.query(sql, [params.branches, params.startDate, params.endDate]);
+  return result.rows.map((r) => ({
+    label: String(r.label),
+    netSales: Number(r.net_sales),
+    grossSales: Number(r.gross_sales),
+    orderCount: Number(r.order_count),
+  }));
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Item-level queries (vw_order_items): quantity/value by menu item.
+// ─────────────────────────────────────────────────────────────────────────
+
+export type ItemGroupBy = "none" | "day" | "week" | "month" | "branch" | "item";
+
+export interface ItemQueryRow {
+  label: string;
+  totalValue: number;
+  quantity: number;
+}
+
+export interface ItemQueryParams {
+  // Already permission-filtered by the caller.
+  branches: string[];
+  startDate: string;
+  endDate: string;
+  groupBy: ItemGroupBy;
   itemSearch?: string;
 }
 
-// The one general-purpose query behind every sales question Calu can
-// answer: a total, a trend over time, a branch comparison, or an item
-// breakdown - all through the same safe, parameterized shape. Every
-// identifier below (table/column names) is a fixed constant from this
-// file, never something supplied by the model - only values (branch
-// names, dates, the item search text) come from the caller, and those
-// are always passed as bound query parameters, never concatenated into
-// the SQL text.
-export async function runSalesQuery(params: SalesQueryParams): Promise<QueryRow[]> {
+export async function runItemsQuery(params: ItemQueryParams): Promise<ItemQueryRow[]> {
   assertValidRange(params.startDate, params.endDate);
   if (params.branches.length === 0) return [];
 
@@ -120,41 +215,24 @@ export async function runSalesQuery(params: SalesQueryParams): Promise<QueryRow[
     conditions.push(`${COL_ITEM_NAME} ilike $${values.length}`);
   }
 
-  let groupExpr = "";
-  let labelExpr = "'Total'";
-  const isTimeGrouping =
-    params.groupBy === "day" || params.groupBy === "week" || params.groupBy === "month";
-
-  if (params.groupBy === "day") {
-    groupExpr = COL_DATE;
-    labelExpr = `to_char(${COL_DATE}, 'YYYY-MM-DD')`;
-  } else if (params.groupBy === "week" || params.groupBy === "month") {
-    const trunc = params.groupBy;
-    groupExpr = `date_trunc('${trunc}', ${COL_DATE})`;
-    labelExpr = `to_char(date_trunc('${trunc}', ${COL_DATE}), 'YYYY-MM-DD')`;
-  } else if (params.groupBy === "branch") {
-    groupExpr = COL_BRANCH;
-    labelExpr = COL_BRANCH;
-  } else if (params.groupBy === "item") {
-    groupExpr = COL_ITEM_NAME;
-    labelExpr = COL_ITEM_NAME;
-  }
+  const { groupExpr, labelExpr, isTimeGrouping } = groupingSql(
+    params.groupBy,
+    COL_DATE,
+    COL_BRANCH,
+    { item: COL_ITEM_NAME }
+  );
 
   const groupClause = groupExpr ? `group by ${groupExpr}` : "";
   const orderClause =
-    params.groupBy === "none"
-      ? ""
-      : isTimeGrouping
-        ? `order by ${groupExpr}`
-        : `order by total_sales desc`;
+    params.groupBy === "none" ? "" : isTimeGrouping ? `order by ${groupExpr}` : `order by total_value desc`;
   const limitClause = isTimeGrouping ? "limit 200" : params.groupBy === "none" ? "" : "limit 50";
 
   const sql = `
     select
       ${labelExpr} as label,
-      coalesce(sum(${COL_AMOUNT}), 0) as total_sales,
+      coalesce(sum(${COL_LINE_VALUE}), 0) as total_value,
       coalesce(sum(${COL_QTY}), 0) as quantity
-    from ${SCHEMA}.${TABLE}
+    from ${SCHEMA}.${ITEMS_TABLE}
     where ${conditions.join(" and ")}
     ${groupClause}
     ${orderClause}
@@ -165,7 +243,7 @@ export async function runSalesQuery(params: SalesQueryParams): Promise<QueryRow[
   const result = await db.query(sql, values);
   return result.rows.map((r) => ({
     label: String(r.label),
-    totalSales: Number(r.total_sales),
+    totalValue: Number(r.total_value),
     quantity: Number(r.quantity),
   }));
 }
