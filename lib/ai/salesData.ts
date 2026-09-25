@@ -18,10 +18,18 @@ let pool: Pool | null = null;
 
 function getPool(): Pool {
   if (!pool) {
+    // Some Postgres setups (especially ones originally meant for
+    // same-network access, like this one's other internal callers) don't
+    // have SSL configured at all - forcing an SSL handshake against those
+    // fails with a generic connection error. Default to no SSL; set
+    // POS_DATABASE_SSL=true in Vercel's env vars if the real server does
+    // require/prefer it.
+    const useSsl = process.env.POS_DATABASE_SSL === "true";
     pool = new Pool({
       connectionString: process.env.POS_DATABASE_URL,
-      ssl: { rejectUnauthorized: false },
+      ssl: useSsl ? { rejectUnauthorized: false } : undefined,
       max: 3,
+      connectionTimeoutMillis: 8000,
     });
   }
   return pool;
