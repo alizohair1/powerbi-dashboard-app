@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import Image from "next/image";
 import {
   Bar,
   BarChart,
@@ -91,7 +92,19 @@ export default function CaluChatPanel({ compact = false }: { compact?: boolean }
         className="flex-1 space-y-4 overflow-y-auto p-5"
       >
         {messages.map((m, i) => (
-          <div key={i} className={m.role === "user" ? "flex justify-end" : "flex justify-start"}>
+          <div
+            key={i}
+            className={
+              m.role === "user"
+                ? "flex justify-end"
+                : "flex items-end gap-2 justify-start"
+            }
+          >
+            {m.role === "assistant" && (
+              <div className="clay flex h-8 w-8 shrink-0 items-center justify-center overflow-hidden p-0.5">
+                <Image src="/calu.png" alt="" width={32} height={32} className="h-full w-full object-cover" />
+              </div>
+            )}
             <div
               className={
                 m.role === "user"
@@ -133,7 +146,10 @@ export default function CaluChatPanel({ compact = false }: { compact?: boolean }
           </div>
         ))}
         {loading && (
-          <div className="flex justify-start">
+          <div className="flex items-end gap-2 justify-start">
+            <div className="clay flex h-8 w-8 shrink-0 items-center justify-center overflow-hidden p-0.5">
+              <Image src="/calu.png" alt="" width={32} height={32} className="h-full w-full object-cover" />
+            </div>
             <div className="clay-well px-4 py-2.5 text-sm text-ink/50">Thinking…</div>
           </div>
         )}
