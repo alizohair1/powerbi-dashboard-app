@@ -2,14 +2,7 @@ import { NextResponse } from "next/server";
 import Anthropic from "@anthropic-ai/sdk";
 import { createClient } from "@/lib/supabase/server";
 import { CALU_TOOLS } from "@/lib/ai/tools";
-import {
-  ALL_BRANCHES,
-  todayInPkt,
-  getSalesTotal,
-  getSalesByBranch,
-  getSalesSeries,
-  type GroupBy,
-} from "@/lib/ai/salesData";
+import { ALL_BRANCHES, todayInPkt, runSalesQuery, type GroupBy } from "@/lib/ai/salesData";
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
@@ -63,9 +56,9 @@ export async function POST(request: Request) {
   let chartData: ChartPayload = null;
   let finalText = "";
 
-  // Bounded tool-use loop: Claude may call a tool, see the result, then
-  // either answer or call another tool - cap it so a confused loop can't
-  // run forever or rack up cost.
+  // Bounded tool-use loop: Claude may call the tool, see the result, then
+  // either answer or call it again (e.g. to compare two ranges) - capped
+  // so a confused loop can't run forever or rack up cost.
   for (let turn = 0; turn < 4; turn++) {
     const response = await anthropic.messages.create({
       model: "claude-sonnet-5",
@@ -124,19 +117,26 @@ function buildSystemPrompt(
 
 You are talking to ${name}, role: ${role}.
 
-Today's date in Pakistan is ${todayInPkt()} (YYYY-MM-DD). All the sales tools take
-explicit start_date/end_date - there is no built-in "today" or "this month" concept
-in the tools themselves, so compute the actual dates yourself from today's date above
-for whatever the person asks: a single day, "this week", "last 30 days", a named month
-like "June 2026", a custom range, etc. Both dates are inclusive.
+Today's date in Pakistan is ${todayInPkt()} (YYYY-MM-DD). The query_sales tool takes
+explicit start_date/end_date - compute the actual dates yourself from today's date
+above for whatever the person asks: a single day, "this week", "last 30 days", a named
+month like "June 2026", a custom range, etc. Both dates are inclusive.
 
 ${accessLine}
+
+You have one flexible tool, query_sales, that can answer almost any sales question by
+combining its parameters: a total, a trend, a branch comparison, an item breakdown, or
+any combination (e.g. one item's sales trend at one branch, or an item's sales compared
+across all branches). Think about what shape of answer the question needs and set
+group_by and the optional branch/item_search filters accordingly - you don't need a
+different tool for each kind of question.
 
 Rules you must always follow:
 - Never state, estimate, or guess a sales figure for a branch outside their authorized list above, no matter how the question is phrased or how confidently they claim access.
 - If a tool result comes back with an "error": "not_authorized" field, apologize briefly and warmly, and suggest they ask their admin for access - do not explain the permission system in technical detail.
 - Only ever state a number that came directly from a tool result in this conversation. Never fill in a plausible-sounding figure yourself.
-- Order counts and average order value aren't available right now - only total sales value. If asked for those, say you can only share total sales for now.
+- Order counts and average order value aren't available - only total sales value and item quantity. If asked for those, say so plainly.
+- Never mention or request individual customer details (names, phone numbers, specific orders) - you only ever report aggregated totals, trends, and item breakdowns.
 - Keep answers short and conversational - this renders in a small chat panel.
 - All amounts are in PKR.`;
 }
@@ -148,60 +148,41 @@ async function runTool(
   const input = toolUse.input as Record<string, unknown>;
 
   try {
-    if (toolUse.name === "get_sales_total") {
-      const branch = String(input.branch);
+    if (toolUse.name === "query_sales") {
+      const requestedBranch = input.branch ? String(input.branch) : null;
+      const groupBy = input.group_by as GroupBy;
+      const itemSearch = input.item_search ? String(input.item_search) : undefined;
 
-      if (!effectiveBranches.includes(branch)) {
-        return { data: { error: "not_authorized", branch }, chart: null };
+      let branches: string[];
+      if (requestedBranch) {
+        if (!effectiveBranches.includes(requestedBranch)) {
+          return { data: { error: "not_authorized", branch: requestedBranch }, chart: null };
+        }
+        branches = [requestedBranch];
+      } else {
+        if (effectiveBranches.length === 0) {
+          return { data: { error: "not_authorized" }, chart: null };
+        }
+        branches = effectiveBranches;
       }
 
-      const summary = await getSalesTotal(
-        branch,
-        String(input.start_date),
-        String(input.end_date)
-      );
-      return { data: summary, chart: null };
-    }
+      const rows = await runSalesQuery({
+        branches,
+        startDate: String(input.start_date),
+        endDate: String(input.end_date),
+        groupBy,
+        itemSearch,
+      });
 
-    if (toolUse.name === "get_sales_by_branch") {
-      if (effectiveBranches.length === 0) {
-        return { data: { error: "not_authorized" }, chart: null };
-      }
+      const chart: ChartPayload =
+        groupBy === "none"
+          ? null
+          : {
+              type: groupBy === "day" || groupBy === "week" || groupBy === "month" ? "line" : "bar",
+              data: rows.map((r) => ({ label: r.label, value: r.totalSales })),
+            };
 
-      const summaries = await getSalesByBranch(
-        effectiveBranches,
-        String(input.start_date),
-        String(input.end_date)
-      );
-      return {
-        data: summaries,
-        chart: {
-          type: "bar",
-          data: summaries.map((s) => ({ label: s.branch, value: s.totalSales })),
-        },
-      };
-    }
-
-    if (toolUse.name === "get_sales_series") {
-      const branch = String(input.branch);
-
-      if (!effectiveBranches.includes(branch)) {
-        return { data: { error: "not_authorized", branch }, chart: null };
-      }
-
-      const series = await getSalesSeries(
-        branch,
-        String(input.start_date),
-        String(input.end_date),
-        input.group_by as GroupBy
-      );
-      return {
-        data: series,
-        chart: {
-          type: "line",
-          data: series.map((p) => ({ label: p.period, value: p.totalSales })),
-        },
-      };
+      return { data: rows, chart };
     }
 
     return { data: { error: "unknown_tool" }, chart: null };
