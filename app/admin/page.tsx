@@ -29,9 +29,10 @@ export default async function AdminPage() {
         <div className="flex items-center gap-2">
           <Link
             href="/ai"
-            className="clay-chip px-4 py-2 text-sm font-medium text-ink/70 hover:text-ink"
+            className="clay-chip flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-ink/70 hover:text-ink"
           >
-            🧪 Ask Calu
+            <Image src="/calu.png" alt="" width={20} height={20} className="h-5 w-5" />
+            Ask Calu
           </Link>
           <LogoutButton />
         </div>
