@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import Image from "next/image";
 import CaluChatPanel from "./CaluChatPanel";
 
 export default function CaluFloatingButton() {
@@ -11,10 +12,20 @@ export default function CaluFloatingButton() {
       <button
         onClick={() => setOpen((o) => !o)}
         aria-label={open ? "Close Calu" : "Open Calu"}
-        className="clay-btn fixed bottom-6 right-6 z-40 flex h-14 w-14 items-center justify-center bg-accent text-2xl text-white hover:bg-accentDeep transition-colors"
+        className="clay-btn fixed bottom-6 right-6 z-40 flex h-16 w-16 items-center justify-center bg-white hover:bg-claySurface transition-colors overflow-hidden"
         style={{ borderRadius: "999px" }}
       >
-        {open ? "×" : "🧪"}
+        {open ? (
+          <span className="text-2xl text-ink">×</span>
+        ) : (
+          <Image
+            src="/calu.png"
+            alt="Calu"
+            width={64}
+            height={64}
+            className="h-full w-full object-cover p-1.5"
+          />
+        )}
       </button>
 
       {open && (
