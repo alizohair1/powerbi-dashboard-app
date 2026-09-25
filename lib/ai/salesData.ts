@@ -1,17 +1,6 @@
 import { Pool } from "pg";
 
-// ─────────────────────────────────────────────────────────────────────────
-// ⚠️  CONFIRM THESE FOUR NAMES before trusting real numbers from Calu.
-// They match what the CMS app already uses (pos.vw_order_items on the same
-// S4U_Sales_data database) but the exact column names are a best guess
-// until you run inspect-db.js and check them. If any differ, this is the
-// only place in the whole feature that needs to change.
-const TABLE = "pos.vw_order_items";
-const COL_BRANCH = "branch";
-const COL_DATE = "order_date";
-const COL_AMOUNT = "net_sales";
-const COL_ORDER_ID = "order_number";
-// ─────────────────────────────────────────────────────────────────────────
+const SCHEMA = "pos";
 
 let pool: Pool | null = null;
 
@@ -87,6 +76,96 @@ function periodToRange(period: Period): { start: string; end: string } {
   return { start: toSqlString(start), end: toSqlString(end) };
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Schema discovery. Calu calls these itself, every conversation, instead of
+// anyone hardcoding table/column names. Both queries only read Postgres's
+// own metadata catalog (information_schema) - they can never return a row
+// of actual business data, so there's nothing sensitive to leak here even
+// before permission checks apply.
+// ─────────────────────────────────────────────────────────────────────────
+
+export interface TableInfo {
+  tableName: string;
+  tableType: string;
+}
+
+export async function listPosTables(): Promise<TableInfo[]> {
+  const db = getPool();
+  const result = await db.query(
+    `select table_name, table_type
+     from information_schema.tables
+     where table_schema = $1
+     order by table_name`,
+    [SCHEMA]
+  );
+  return result.rows.map((r) => ({
+    tableName: r.table_name as string,
+    tableType: r.table_type as string,
+  }));
+}
+
+export interface ColumnInfo {
+  columnName: string;
+  dataType: string;
+}
+
+export async function describeTable(tableName: string): Promise<ColumnInfo[]> {
+  const db = getPool();
+  const result = await db.query(
+    `select column_name, data_type
+     from information_schema.columns
+     where table_schema = $1 and table_name = $2
+     order by ordinal_position`,
+    [SCHEMA, tableName]
+  );
+  return result.rows.map((r) => ({
+    columnName: r.column_name as string,
+    dataType: r.data_type as string,
+  }));
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Query execution. Every table/column name below comes from Claude, but
+// none of it is ever interpolated into SQL until it's been checked against
+// a fresh, real describeTable()/listPosTables() result - so the only way
+// an identifier reaches the query is if it's the literal name of something
+// that actually exists in the read-only "pos" schema. That's what makes
+// this safe without falling back to a parameterized-values-only query,
+// which can't parameterize column/table names at all.
+// ─────────────────────────────────────────────────────────────────────────
+
+function quoteIdent(name: string): string {
+  return `"${name.replace(/"/g, '""')}"`;
+}
+
+async function assertTableExists(tableName: string): Promise<void> {
+  const tables = await listPosTables();
+  if (!tables.some((t) => t.tableName === tableName)) {
+    throw new Error(`"${tableName}" is not a real table/view in the pos schema.`);
+  }
+}
+
+async function assertColumnsExist(
+  tableName: string,
+  columns: string[]
+): Promise<void> {
+  const cols = await describeTable(tableName);
+  const validNames = new Set(cols.map((c) => c.columnName));
+  for (const c of columns) {
+    if (!validNames.has(c)) {
+      throw new Error(`"${c}" is not a real column on pos.${tableName}.`);
+    }
+  }
+}
+
+export interface QueryColumns {
+  table: string;
+  branchColumn: string;
+  dateColumn: string;
+  amountColumn: string;
+  orderIdColumn: string;
+}
+
 export interface BranchSummary {
   branch: string;
   totalSales: number;
@@ -94,19 +173,28 @@ export interface BranchSummary {
 }
 
 export async function getSalesSummary(
+  cols: QueryColumns,
   branch: string,
   period: Period
 ): Promise<BranchSummary> {
+  await assertTableExists(cols.table);
+  await assertColumnsExist(cols.table, [
+    cols.branchColumn,
+    cols.dateColumn,
+    cols.amountColumn,
+    cols.orderIdColumn,
+  ]);
+
   const { start, end } = periodToRange(period);
   const db = getPool();
   const result = await db.query(
     `select
-       coalesce(sum(${COL_AMOUNT}), 0) as total_sales,
-       count(distinct ${COL_ORDER_ID}) as order_count
-     from ${TABLE}
-     where ${COL_BRANCH} = $1
-       and ${COL_DATE} >= $2
-       and ${COL_DATE} < $3`,
+       coalesce(sum(${quoteIdent(cols.amountColumn)}), 0) as total_sales,
+       count(distinct ${quoteIdent(cols.orderIdColumn)}) as order_count
+     from ${SCHEMA}.${quoteIdent(cols.table)}
+     where ${quoteIdent(cols.branchColumn)} = $1
+       and ${quoteIdent(cols.dateColumn)} >= $2
+       and ${quoteIdent(cols.dateColumn)} < $3`,
     [branch, start, end]
   );
   const row = result.rows[0];
@@ -118,10 +206,11 @@ export async function getSalesSummary(
 }
 
 export async function getSalesByBranch(
+  cols: QueryColumns,
   branches: string[],
   period: Period
 ): Promise<BranchSummary[]> {
-  return Promise.all(branches.map((b) => getSalesSummary(b, period)));
+  return Promise.all(branches.map((b) => getSalesSummary(cols, b, period)));
 }
 
 export interface DailyPoint {
@@ -130,18 +219,26 @@ export interface DailyPoint {
 }
 
 export async function getSalesTrend(
+  cols: QueryColumns,
   branch: string,
   days: number
 ): Promise<DailyPoint[]> {
+  await assertTableExists(cols.table);
+  await assertColumnsExist(cols.table, [
+    cols.branchColumn,
+    cols.dateColumn,
+    cols.amountColumn,
+  ]);
+
   const db = getPool();
   const clampedDays = Math.min(Math.max(Math.round(days), 1), 90);
   const result = await db.query(
     `select
-       date_trunc('day', ${COL_DATE}) as day,
-       coalesce(sum(${COL_AMOUNT}), 0) as total_sales
-     from ${TABLE}
-     where ${COL_BRANCH} = $1
-       and ${COL_DATE} >= now() - ($2 || ' days')::interval
+       date_trunc('day', ${quoteIdent(cols.dateColumn)}) as day,
+       coalesce(sum(${quoteIdent(cols.amountColumn)}), 0) as total_sales
+     from ${SCHEMA}.${quoteIdent(cols.table)}
+     where ${quoteIdent(cols.branchColumn)} = $1
+       and ${quoteIdent(cols.dateColumn)} >= now() - ($2 || ' days')::interval
      group by 1
      order by 1`,
     [branch, clampedDays]
