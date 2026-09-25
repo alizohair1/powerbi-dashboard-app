@@ -1,0 +1,38 @@
+import { redirect } from "next/navigation";
+import { createClient } from "@/lib/supabase/server";
+import LogoutButton from "@/components/LogoutButton";
+import CaluChatPanel from "@/components/CaluChatPanel";
+
+export default async function CaluPage() {
+  const supabase = await createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+
+  if (!user) redirect("/login");
+
+  const { data: profile } = await supabase
+    .from("profiles")
+    .select("full_name")
+    .eq("id", user.id)
+    .single();
+
+  return (
+    <div className="h-screen overflow-hidden relative">
+      <header className="absolute inset-x-0 top-0 h-20 flex items-center justify-between gap-4 px-6">
+        <div>
+          <p className="text-xs uppercase tracking-[0.2em] text-accentDeep font-medium">
+            Calu
+          </p>
+          <p className="font-display font-semibold text-ink">
+            {profile?.full_name || user.email}
+          </p>
+        </div>
+        <LogoutButton />
+      </header>
+      <main className="absolute inset-x-0 bottom-0 top-20 px-6 pb-6">
+        <CaluChatPanel />
+      </main>
+    </div>
+  );
+}
